@@ -17,7 +17,7 @@ cargo run            # Run the worker (needs PERRY_HUB_URL)
 - **Assets** (`build/assets.rs`): Generates Windows .ico files from source PNGs
 - **Compiler** (`build/compiler.rs`): Invokes `perry compile --target windows` to produce .exe
 - **Packaging** (`package/windows.rs`): NSIS installer, MSIX, portable ZIP; embeds PE resources (icon, version info, manifest)
-- **Signing** (`signing/windows.rs`): signtool.exe (PFX) or AzureSignTool (Azure Trusted Signing)
+- **Signing** (`signing/windows.rs`): signtool.exe (PFX), AzureSignTool (Azure Trusted Signing), or Google Cloud KMS CNG provider
 
 ## Environment Variables
 
@@ -34,6 +34,7 @@ cargo run            # Run the worker (needs PERRY_HUB_URL)
 - **Windows SDK** (for signtool.exe, MakeAppx.exe) — auto-detected under `C:\Program Files (x86)\Windows Kits\10\`
 - **NSIS** (for installer creation) — auto-detected at `C:\Program Files (x86)\NSIS\`
 - **AzureSignTool** (optional, for Azure Trusted Signing) — install via `dotnet tool install -g AzureSignTool`
+- **Google Cloud KMS CNG Provider** (optional, for KMS signing) — auto-installed on first use if missing
 
 ## Distribution Modes
 

@@ -53,6 +53,13 @@ pub struct BuildCredentials {
     pub azure_signing_account: Option<String>,
     #[serde(default)]
     pub azure_signing_profile: Option<String>,
+    // Google Cloud KMS signing fields
+    #[serde(default)]
+    pub gcloud_kms_key: Option<String>,
+    #[serde(default)]
+    pub gcloud_kms_cert_base64: Option<String>,
+    #[serde(default)]
+    pub gcloud_service_account_base64: Option<String>,
 }
 
 impl BuildCredentials {
@@ -73,6 +80,12 @@ impl BuildCredentials {
             && self.azure_signing_endpoint.is_some()
             && self.azure_signing_account.is_some()
             && self.azure_signing_profile.is_some()
+    }
+
+    pub fn has_gcloud_kms(&self) -> bool {
+        self.gcloud_kms_key.is_some()
+            && self.gcloud_kms_cert_base64.is_some()
+            && self.gcloud_service_account_base64.is_some()
     }
 }
 
