@@ -1,8 +1,13 @@
+use crate::build::docker::{ContainerMount, ContainerRun, run_in_container};
 use crate::build::validate::{escape_nsis, escape_xml};
-use crate::config;
+use crate::config::{self, WorkerConfig};
 use crate::queue::job::BuildManifest;
+use crate::ws::messages::StageName;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// System DLLs that should NOT be bundled (lowercase for comparison)
 const SYSTEM_DLLS: &[&str] = &[
@@ -510,33 +515,156 @@ pub async fn create_nsis_installer(
     manifest: &BuildManifest,
     bundle_dir: &Path,
     output_path: &Path,
-    nsis_path_override: Option<&str>,
+    config: &WorkerConfig,
 ) -> Result<(), String> {
-    let makensis = config::find_makensis_with_override(nsis_path_override)
-        .ok_or("makensis.exe not found. Install NSIS or set PERRY_BUILD_NSIS_PATH.")?;
-
     let app_name = escape_nsis(&manifest.app_name);
     let version = escape_nsis(&manifest.version);
-    let bundle_dir_str = bundle_dir.to_string_lossy().replace('/', "\\");
-    let output_str = output_path.to_string_lossy().replace('/', "\\");
+    let company = escape_nsis(manifest.windows_company_name.as_deref().unwrap_or(""));
 
-    // Collect files to install
-    let mut install_files = String::new();
-    let mut uninstall_files = String::new();
+    // Collect files to install (always scan the host bundle_dir)
+    let mut file_names: Vec<String> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(bundle_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.ends_with(".exe.manifest") {
-                continue; // Manifest is embedded, skip standalone copy
+                continue;
             }
-            install_files.push_str(&format!(
-                "  File \"{bundle_dir_str}\\{name}\"\n"
-            ));
-            uninstall_files.push_str(&format!("  Delete \"$INSTDIR\\{name}\"\n"));
+            file_names.push(name);
         }
     }
 
-    let nsi_script = format!(
+    if config.docker.enabled {
+        create_nsis_in_container(manifest, bundle_dir, output_path, config, &app_name, &version, &company, &file_names).await
+    } else {
+        create_nsis_direct(manifest, bundle_dir, output_path, config, &app_name, &version, &company, &file_names).await
+    }
+}
+
+async fn create_nsis_direct(
+    _manifest: &BuildManifest,
+    bundle_dir: &Path,
+    output_path: &Path,
+    config: &WorkerConfig,
+    app_name: &str,
+    version: &str,
+    company: &str,
+    file_names: &[String],
+) -> Result<(), String> {
+    let makensis = config::find_makensis_with_override(config.nsis_path.as_deref())
+        .ok_or("makensis.exe not found. Install NSIS or set PERRY_BUILD_NSIS_PATH.")?;
+
+    let bundle_dir_str = bundle_dir.to_string_lossy().replace('/', "\\");
+    let output_str = output_path.to_string_lossy().replace('/', "\\");
+
+    let nsi_script = generate_nsi_script(app_name, version, company, file_names, &bundle_dir_str, &output_str);
+
+    let nsi_path = bundle_dir.join("installer.nsi");
+    std::fs::write(&nsi_path, &nsi_script)
+        .map_err(|e| format!("Failed to write NSI script: {e}"))?;
+
+    let output = tokio::process::Command::new(makensis)
+        .arg(&nsi_path)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run makensis: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "makensis failed (exit {}):\nstdout: {stdout}\nstderr: {stderr}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+
+    Ok(())
+}
+
+async fn create_nsis_in_container(
+    _manifest: &BuildManifest,
+    bundle_dir: &Path,
+    output_path: &Path,
+    config: &WorkerConfig,
+    app_name: &str,
+    version: &str,
+    company: &str,
+    file_names: &[String],
+) -> Result<(), String> {
+    let dc = &config.docker;
+    let output_dir = output_path.parent().ok_or("Invalid output path")?;
+    let output_name = output_path.file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Invalid output filename")?;
+
+    // Generate NSI script with container-side paths
+    let nsi_script = generate_nsi_script(
+        app_name, version, company, file_names,
+        r"C:\bundle",
+        &format!(r"C:\output\{output_name}"),
+    );
+
+    let nsi_path = bundle_dir.join("installer.nsi");
+    std::fs::write(&nsi_path, &nsi_script)
+        .map_err(|e| format!("Failed to write NSI script: {e}"))?;
+
+    let bundle_dir_str = bundle_dir.to_string_lossy().to_string();
+    let output_dir_str = output_dir.to_string_lossy().to_string();
+
+    let run = ContainerRun {
+        name: format!("perry-nsis-{}", app_name.to_lowercase().replace(' ', "-")),
+        image: dc.image.clone(),
+        isolation: dc.isolation.clone(),
+        mounts: vec![
+            ContainerMount {
+                host_path: dc.nsis_path.clone(),
+                container_path: r"C:\NSIS".into(),
+                read_only: true,
+            },
+            ContainerMount {
+                host_path: bundle_dir_str,
+                container_path: r"C:\bundle".into(),
+                read_only: true,
+            },
+            ContainerMount {
+                host_path: output_dir_str,
+                container_path: r"C:\output".into(),
+                read_only: false,
+            },
+        ],
+        working_dir: None,
+        env_vars: vec![],
+        command: format!(r"C:\NSIS\makensis.exe C:\bundle\installer.nsi"),
+        timeout: Duration::from_secs(dc.timeout_secs),
+        network: false,
+    };
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    run_in_container(&run, &tx, StageName::Packaging, &cancelled).await?;
+
+    if !output_path.exists() {
+        return Err("NSIS installer was not created".into());
+    }
+
+    Ok(())
+}
+
+fn generate_nsi_script(
+    app_name: &str,
+    version: &str,
+    company: &str,
+    file_names: &[String],
+    bundle_dir_str: &str,
+    output_str: &str,
+) -> String {
+    let mut install_files = String::new();
+    let mut uninstall_files = String::new();
+    for name in file_names {
+        install_files.push_str(&format!("  File \"{bundle_dir_str}\\{name}\"\n"));
+        uninstall_files.push_str(&format!("  Delete \"$INSTDIR\\{name}\"\n"));
+    }
+
+    format!(
         r#"!include "MUI2.nsh"
 
 Name "{app_name}"
@@ -586,29 +714,7 @@ Section "Uninstall"
   DeleteRegKey HKLM "Software\{app_name}"
 SectionEnd
 "#,
-        company = escape_nsis(manifest.windows_company_name.as_deref().unwrap_or("")),
-    );
-
-    let nsi_path = bundle_dir.join("installer.nsi");
-    std::fs::write(&nsi_path, &nsi_script)
-        .map_err(|e| format!("Failed to write NSI script: {e}"))?;
-
-    let output = tokio::process::Command::new(makensis)
-        .arg(&nsi_path)
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run makensis: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!(
-            "makensis failed (exit {}):\nstdout: {stdout}\nstderr: {stderr}",
-            output.status.code().unwrap_or(-1)
-        ));
-    }
-
-    Ok(())
+    )
 }
 
 /// Create an MSIX package using MakeAppx.exe.
@@ -616,33 +722,86 @@ pub async fn create_msix_package(
     manifest: &BuildManifest,
     bundle_dir: &Path,
     output_path: &Path,
+    config: &WorkerConfig,
 ) -> Result<(), String> {
-    let makeappx = config::find_makeappx()
-        .ok_or("MakeAppx.exe not found. Install Windows SDK.")?;
-
     // Generate AppxManifest.xml
     let appx_manifest = generate_appx_manifest(manifest);
     let manifest_path = bundle_dir.join("AppxManifest.xml");
     std::fs::write(&manifest_path, &appx_manifest)
         .map_err(|e| format!("Failed to write AppxManifest.xml: {e}"))?;
 
-    let output = tokio::process::Command::new(makeappx)
-        .arg("pack")
-        .arg("/d")
-        .arg(bundle_dir)
-        .arg("/p")
-        .arg(output_path)
-        .arg("/o") // overwrite
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run MakeAppx: {e}"))?;
+    if config.docker.enabled {
+        let dc = &config.docker;
+        let sdk_ver = dc.sdk_version.as_deref()
+            .ok_or("Windows SDK version not detected — cannot create MSIX in container")?;
+        let output_dir = output_path.parent().ok_or("Invalid output path")?;
+        let output_name = output_path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("Invalid output filename")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "MakeAppx failed (exit {}): {stderr}",
-            output.status.code().unwrap_or(-1)
-        ));
+        let makeappx_path = format!(
+            r"C:\WinKits\10\bin\{sdk_ver}\x64\makeappx.exe"
+        );
+
+        let run = ContainerRun {
+            name: format!("perry-msix-{}", manifest.app_name.to_lowercase().replace(' ', "-")),
+            image: dc.image.clone(),
+            isolation: dc.isolation.clone(),
+            mounts: vec![
+                ContainerMount {
+                    host_path: dc.winkits_path.clone(),
+                    container_path: r"C:\WinKits".into(),
+                    read_only: true,
+                },
+                ContainerMount {
+                    host_path: bundle_dir.to_string_lossy().to_string(),
+                    container_path: r"C:\bundle".into(),
+                    read_only: true,
+                },
+                ContainerMount {
+                    host_path: output_dir.to_string_lossy().to_string(),
+                    container_path: r"C:\output".into(),
+                    read_only: false,
+                },
+            ],
+            working_dir: None,
+            env_vars: vec![],
+            command: format!(
+                r#"{makeappx_path} pack /d C:\bundle /p C:\output\{output_name} /o"#
+            ),
+            timeout: Duration::from_secs(dc.timeout_secs),
+            network: false,
+        };
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        run_in_container(&run, &tx, StageName::Packaging, &cancelled).await?;
+
+        if !output_path.exists() {
+            return Err("MakeAppx did not create the MSIX package".into());
+        }
+    } else {
+        let makeappx = config::find_makeappx()
+            .ok_or("MakeAppx.exe not found. Install Windows SDK.")?;
+
+        let output = tokio::process::Command::new(makeappx)
+            .arg("pack")
+            .arg("/d")
+            .arg(bundle_dir)
+            .arg("/p")
+            .arg(output_path)
+            .arg("/o")
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run MakeAppx: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "MakeAppx failed (exit {}): {stderr}",
+                output.status.code().unwrap_or(-1)
+            ));
+        }
     }
 
     Ok(())

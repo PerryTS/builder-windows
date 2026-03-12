@@ -75,7 +75,7 @@ async fn run_windows_pipeline(
         &request.manifest,
         progress,
         cancelled,
-        &config.perry_binary,
+        config,
         &project_dir,
         &binary_path,
         Some("windows"),
@@ -140,7 +140,7 @@ async fn run_windows_pipeline(
     let artifact_path = match distribute {
         "msix" => {
             let msix_path = tmpdir.join(format!("{}.msix", request.manifest.app_name));
-            win_package::create_msix_package(&request.manifest, &bundle_dir, &msix_path).await?;
+            win_package::create_msix_package(&request.manifest, &bundle_dir, &msix_path, config).await?;
             // Sign the MSIX too
             let _ =
                 win_signing::sign_executable(&msix_path, &request.credentials, tmpdir).await;
@@ -159,7 +159,7 @@ async fn run_windows_pipeline(
                 &request.manifest,
                 &bundle_dir,
                 &installer_path,
-                config.nsis_path.as_deref(),
+                config,
             )
             .await?;
             // Sign the installer too
