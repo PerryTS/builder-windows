@@ -1,3 +1,4 @@
+use crate::build::validate::{escape_nsis, escape_xml};
 use crate::config;
 use crate::queue::job::BuildManifest;
 use std::io::Write;
@@ -187,8 +188,10 @@ fn generate_app_manifest(manifest: &BuildManifest) -> String {
     </windowsSettings>
   </application>
 </assembly>"#,
-        bundle_id = manifest.bundle_id,
-        version = manifest.version,
+        bundle_id = escape_xml(&manifest.bundle_id),
+        version = escape_xml(&manifest.version),
+        uac_level = escape_xml(uac_level),
+        dpi_aware = escape_xml(dpi_aware),
     )
 }
 
@@ -512,8 +515,8 @@ pub async fn create_nsis_installer(
     let makensis = config::find_makensis_with_override(nsis_path_override)
         .ok_or("makensis.exe not found. Install NSIS or set PERRY_BUILD_NSIS_PATH.")?;
 
-    let app_name = &manifest.app_name;
-    let version = &manifest.version;
+    let app_name = escape_nsis(&manifest.app_name);
+    let version = escape_nsis(&manifest.version);
     let bundle_dir_str = bundle_dir.to_string_lossy().replace('/', "\\");
     let output_str = output_path.to_string_lossy().replace('/', "\\");
 
@@ -583,7 +586,7 @@ Section "Uninstall"
   DeleteRegKey HKLM "Software\{app_name}"
 SectionEnd
 "#,
-        company = manifest.windows_company_name.as_deref().unwrap_or(""),
+        company = escape_nsis(manifest.windows_company_name.as_deref().unwrap_or("")),
     );
 
     let nsi_path = bundle_dir.join("installer.nsi");
@@ -680,9 +683,11 @@ fn generate_appx_manifest(manifest: &BuildManifest) -> String {
     </Application>
   </Applications>
 </Package>"#,
-        bundle_id = manifest.bundle_id,
-        app_name = manifest.app_name,
-        version = manifest.version,
+        bundle_id = escape_xml(&manifest.bundle_id),
+        app_name = escape_xml(&manifest.app_name),
+        version = escape_xml(&manifest.version),
+        publisher = escape_xml(publisher),
+        description = escape_xml(description),
     )
 }
 
