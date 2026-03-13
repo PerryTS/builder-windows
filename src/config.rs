@@ -8,6 +8,7 @@ pub struct WorkerConfig {
     pub worker_name: Option<String>,
     pub windows_sdk_path: Option<String>,
     pub nsis_path: Option<String>,
+    pub hub_secret: Option<String>,
     pub docker: DockerConfig,
 }
 
@@ -57,6 +58,7 @@ impl WorkerConfig {
             worker_name: env::var("PERRY_WORKER_NAME").ok(),
             windows_sdk_path: env::var("PERRY_BUILD_WINDOWS_SDK_PATH").ok(),
             nsis_path: env::var("PERRY_BUILD_NSIS_PATH").ok(),
+            hub_secret: env::var("PERRY_HUB_WORKER_SECRET").ok(),
             docker: DockerConfig {
                 enabled: docker_enabled,
                 image: env::var("PERRY_DOCKER_IMAGE")
