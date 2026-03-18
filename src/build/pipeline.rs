@@ -7,6 +7,7 @@ use crate::package::windows as win_package;
 use crate::queue::job::{BuildCredentials, BuildManifest};
 use crate::signing::windows as win_signing;
 use crate::ws::messages::{ServerMessage, StageName};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,6 +24,58 @@ pub struct BuildRequest {
 /// Progress sender type alias
 type ProgressSender = UnboundedSender<ServerMessage>;
 
+/// Metadata from a precompiled bundle created by the Linux cross-compilation worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrecompiledMetadata {
+    pub perry_version: String,
+    pub compiled_by: String,
+    pub compile_timestamp: String,
+}
+
+/// Paths to files extracted from a precompiled bundle.
+struct PrecompiledBundle {
+    exe_path: PathBuf,
+    ico_path: Option<PathBuf>,
+    dll_dir: Option<PathBuf>,
+}
+
+/// Check if an extracted tarball contains a precompiled bundle (from Linux cross-compilation).
+/// The sentinel is `perry-precompiled/metadata.json` which never exists in normal source tarballs.
+fn detect_precompiled_bundle(project_dir: &std::path::Path) -> Option<PrecompiledMetadata> {
+    let metadata_path = project_dir.join("perry-precompiled").join("metadata.json");
+    if !metadata_path.exists() {
+        return None;
+    }
+    let data = std::fs::read_to_string(&metadata_path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Extract paths from a precompiled bundle directory.
+fn unpack_precompiled_bundle(
+    project_dir: &std::path::Path,
+    app_name: &str,
+) -> Result<PrecompiledBundle, String> {
+    let bundle_dir = project_dir.join("perry-precompiled");
+
+    let exe_name = format!("{}.exe", app_name);
+    let exe_path = bundle_dir.join(&exe_name);
+    if !exe_path.exists() {
+        return Err(format!("Precompiled bundle missing {exe_name}"));
+    }
+
+    let ico_path = bundle_dir.join("app.ico");
+    let ico_opt = if ico_path.exists() { Some(ico_path) } else { None };
+
+    let dll_dir = bundle_dir.join("dlls");
+    let dll_opt = if dll_dir.exists() && dll_dir.is_dir() { Some(dll_dir) } else { None };
+
+    Ok(PrecompiledBundle {
+        exe_path,
+        ico_path: ico_opt,
+        dll_dir: dll_opt,
+    })
+}
+
 pub async fn execute_build(
     request: &BuildRequest,
     config: &WorkerConfig,
@@ -33,7 +86,24 @@ pub async fn execute_build(
 
     let tmpdir = create_build_tmpdir().map_err(|e| format!("Failed to create tmpdir: {e}"))?;
 
-    let result = run_windows_pipeline(request, config, &cancelled, &progress, &tmpdir).await;
+    // Extract tarball first to detect build mode
+    let project_dir = tmpdir.join("project");
+    std::fs::create_dir_all(&project_dir)
+        .map_err(|e| format!("Failed to create project dir: {e}"))?;
+    extract_tarball(&request.tarball_path, &project_dir)?;
+
+    let result = if let Some(metadata) = detect_precompiled_bundle(&project_dir) {
+        tracing::info!(
+            "Detected precompiled bundle (compiled by {}, perry {})",
+            metadata.compiled_by,
+            metadata.perry_version
+        );
+        run_sign_only_pipeline(request, config, &cancelled, &progress, &tmpdir, &project_dir)
+            .await
+    } else {
+        run_windows_pipeline(request, config, &cancelled, &progress, &tmpdir, Some(&project_dir))
+            .await
+    };
 
     // Always clean up build tmpdir
     cleanup_tmpdir(&tmpdir);
@@ -47,6 +117,7 @@ async fn run_windows_pipeline(
     cancelled: &Arc<AtomicBool>,
     progress: &ProgressSender,
     tmpdir: &std::path::Path,
+    pre_extracted: Option<&std::path::Path>,
 ) -> Result<PathBuf, String> {
     let distribute = request
         .manifest
@@ -54,14 +125,22 @@ async fn run_windows_pipeline(
         .as_deref()
         .unwrap_or("installer");
 
-    // Stage 1: Extract tarball
-    send_stage(progress, StageName::Extracting, "Extracting project archive");
-    check_cancelled(cancelled)?;
-    let project_dir = tmpdir.join("project");
-    std::fs::create_dir_all(&project_dir)
-        .map_err(|e| format!("Failed to create project dir: {e}"))?;
-    extract_tarball(&request.tarball_path, &project_dir)?;
-    send_progress(progress, StageName::Extracting, 100, None);
+    let project_dir = if let Some(dir) = pre_extracted {
+        // Already extracted by execute_build
+        send_stage(progress, StageName::Extracting, "Project already extracted");
+        send_progress(progress, StageName::Extracting, 100, None);
+        dir.to_path_buf()
+    } else {
+        // Stage 1: Extract tarball
+        send_stage(progress, StageName::Extracting, "Extracting project archive");
+        check_cancelled(cancelled)?;
+        let dir = tmpdir.join("project");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Failed to create project dir: {e}"))?;
+        extract_tarball(&request.tarball_path, &dir)?;
+        send_progress(progress, StageName::Extracting, 100, None);
+        dir
+    };
 
     // Stage 2: Compile
     send_stage(progress, StageName::Compiling, "Compiling TypeScript to native");
@@ -190,6 +269,127 @@ async fn run_windows_pipeline(
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("exe"),
+    )?;
+    Ok(final_path)
+}
+
+/// Sign-only pipeline for precompiled bundles from the Linux cross-compilation worker.
+/// Skips compilation and asset generation; only does resource embedding, signing, and packaging.
+async fn run_sign_only_pipeline(
+    request: &BuildRequest,
+    config: &WorkerConfig,
+    cancelled: &Arc<AtomicBool>,
+    progress: &ProgressSender,
+    tmpdir: &std::path::Path,
+    project_dir: &std::path::Path,
+) -> Result<PathBuf, String> {
+    let distribute = request
+        .manifest
+        .windows_distribute
+        .as_deref()
+        .unwrap_or("installer");
+
+    // Stage 1: Already extracted
+    send_stage(progress, StageName::Extracting, "Precompiled bundle extracted");
+    send_progress(progress, StageName::Extracting, 100, None);
+
+    // Stage 2: Skip compilation (already done by Linux worker)
+    send_stage(progress, StageName::Compiling, "Skipping compilation (precompiled by Linux worker)");
+    send_progress(progress, StageName::Compiling, 100, None);
+
+    // Stage 3: Skip asset generation (ICO already in bundle)
+    send_stage(progress, StageName::GeneratingAssets, "Using precompiled assets");
+    send_progress(progress, StageName::GeneratingAssets, 100, None);
+
+    // Unpack the precompiled bundle
+    let bundle = unpack_precompiled_bundle(project_dir, &request.manifest.app_name)?;
+
+    // Stage 4: Bundle — copy exe + DLLs and embed PE resources
+    send_stage(progress, StageName::Bundling, "Embedding resources into executable");
+    check_cancelled(cancelled)?;
+    let bundle_dir = tmpdir.join("bundle");
+    std::fs::create_dir_all(&bundle_dir)
+        .map_err(|e| format!("Failed to create bundle dir: {e}"))?;
+
+    // Copy exe to bundle dir
+    let binary_name = format!("{}.exe", request.manifest.app_name);
+    let dest_exe = bundle_dir.join(&binary_name);
+    std::fs::copy(&bundle.exe_path, &dest_exe)
+        .map_err(|e| format!("Failed to copy exe to bundle: {e}"))?;
+
+    // Copy DLLs from precompiled bundle
+    if let Some(ref dll_dir) = bundle.dll_dir {
+        if let Ok(entries) = std::fs::read_dir(dll_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let dest = bundle_dir.join(entry.file_name());
+                    std::fs::copy(&path, &dest)
+                        .map_err(|e| format!("Failed to copy DLL: {e}"))?;
+                }
+            }
+        }
+    }
+
+    // Embed PE resources (icon, version info, manifest XML)
+    let ico_ref = bundle.ico_path.as_deref();
+    win_package::finalize_windows_bundle(&request.manifest, &bundle_dir, ico_ref)?;
+    send_progress(progress, StageName::Bundling, 100, None);
+
+    // Stage 5: Sign the .exe
+    send_stage(progress, StageName::Signing, "Signing executable");
+    check_cancelled(cancelled)?;
+    let bundled_exe = bundle_dir.join(&binary_name);
+    let signed = win_signing::sign_executable(&bundled_exe, &request.credentials, tmpdir).await;
+    if let Err(ref e) = signed {
+        tracing::warn!("Signing skipped or failed: {e}");
+    }
+    send_progress(progress, StageName::Signing, 100, None);
+
+    // Stage 6: Package based on distribution mode
+    send_stage(
+        progress,
+        StageName::Packaging,
+        &format!("Creating {distribute} package"),
+    );
+    check_cancelled(cancelled)?;
+
+    let artifact_path = match distribute {
+        "msix" => {
+            let msix_path = tmpdir.join(format!("{}.msix", request.manifest.app_name));
+            win_package::create_msix_package(&request.manifest, &bundle_dir, &msix_path, config).await?;
+            let _ = win_signing::sign_executable(&msix_path, &request.credentials, tmpdir).await;
+            msix_path
+        }
+        "portable" => {
+            let zip_path = tmpdir.join(format!("{}.zip", request.manifest.app_name));
+            win_package::create_portable_zip(&bundle_dir, &zip_path)?;
+            zip_path
+        }
+        _ => {
+            let installer_path = tmpdir.join(format!("{}-Setup.exe", request.manifest.app_name));
+            win_package::create_nsis_installer(
+                &request.manifest,
+                &bundle_dir,
+                &installer_path,
+                config,
+            )
+            .await?;
+            let _ = win_signing::sign_executable(&installer_path, &request.credentials, tmpdir).await;
+            installer_path
+        }
+    };
+    send_progress(progress, StageName::Packaging, 100, None);
+
+    // Stage 7: Publishing (deferred)
+    send_stage(progress, StageName::Publishing, "Skipping store upload (not configured)");
+    send_progress(progress, StageName::Publishing, 100, None);
+
+    let final_path = copy_artifact(
+        &artifact_path,
+        &request.manifest.app_name,
+        &request.job_id,
+        artifact_path.extension().and_then(|e| e.to_str()).unwrap_or("exe"),
     )?;
     Ok(final_path)
 }

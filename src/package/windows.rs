@@ -97,6 +97,32 @@ pub fn create_windows_bundle(
     Ok(())
 }
 
+/// Finalize a precompiled Windows bundle by embedding PE resources.
+/// Unlike `create_windows_bundle`, this does NOT copy the exe or scan DLLs —
+/// those are already in the bundle directory from the precompiled bundle.
+pub fn finalize_windows_bundle(
+    manifest: &BuildManifest,
+    bundle_dir: &Path,
+    ico_path: Option<&Path>,
+) -> Result<(), String> {
+    let exe_name = format!("{}.exe", manifest.app_name);
+    let dest_exe = bundle_dir.join(&exe_name);
+    if !dest_exe.exists() {
+        return Err(format!("Bundle directory missing {exe_name}"));
+    }
+
+    // Write application manifest XML
+    let manifest_xml = generate_app_manifest(manifest);
+    let manifest_path = bundle_dir.join(format!("{}.exe.manifest", manifest.app_name));
+    std::fs::write(&manifest_path, &manifest_xml)
+        .map_err(|e| format!("Failed to write manifest: {e}"))?;
+
+    // Embed resources into the exe (icon, version info, manifest)
+    embed_resources(&dest_exe, manifest, ico_path, &manifest_xml)?;
+
+    Ok(())
+}
+
 /// Scan PE imports using pelite and copy non-system DLLs from the same directory as the binary.
 fn scan_and_copy_dlls(binary_path: &Path, bundle_dir: &Path) -> Result<(), String> {
     let data = std::fs::read(binary_path)
