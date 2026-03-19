@@ -241,10 +241,56 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
 
     tracing::info!("Connected to hub, waiting for jobs...");
 
+    // Azure auto-deallocate: load config and idle timeout
+    let azure_config = crate::azure::AzureVmConfig::from_env();
+    let idle_timeout = std::time::Duration::from_secs(crate::azure::AzureVmConfig::idle_timeout_mins() * 60);
+    let mut last_activity = std::time::Instant::now();
+
+    if azure_config.is_some() {
+        tracing::info!(
+            timeout_mins = idle_timeout.as_secs() / 60,
+            "Azure auto-deallocate enabled"
+        );
+    }
+
     // Track current cancellation flag
     let cancelled = Arc::new(AtomicBool::new(false));
 
-    while let Some(msg) = read.next().await {
+    loop {
+        let remaining = idle_timeout.saturating_sub(last_activity.elapsed());
+
+        let msg = tokio::select! {
+            msg = read.next() => {
+                match msg {
+                    Some(msg) => msg,
+                    None => break,
+                }
+            }
+            _ = tokio::time::sleep(remaining), if azure_config.is_some() && remaining > std::time::Duration::ZERO => {
+                // Timer expired, will check idle timeout below
+                if let Some(ref az_config) = azure_config {
+                    if last_activity.elapsed() >= idle_timeout {
+                        tracing::info!(
+                            idle_mins = idle_timeout.as_secs() / 60,
+                            "Idle timeout reached, deallocating Azure VM..."
+                        );
+                        match crate::azure::deallocate_self(az_config).await {
+                            Ok(()) => {
+                                tracing::info!("Deallocate request sent, shutting down");
+                                std::process::exit(0);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to deallocate: {e}");
+                                // Reset timer so we retry after another idle period
+                                last_activity = std::time::Instant::now();
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+        };
+
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
@@ -280,6 +326,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                 auth_token,
             } => {
                 tracing::info!(job_id = %job_id, "Received job assignment");
+                last_activity = std::time::Instant::now();
 
                 // Reset cancellation flag
                 cancelled.store(false, Ordering::Relaxed);
@@ -579,6 +626,9 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                         let _ = write.send(Message::Text(complete_msg.into())).await;
                     }
                 }
+
+                // Reset idle timer after build completes (success, failure, or panic)
+                last_activity = std::time::Instant::now();
             }
 
             HubMessage::Cancel { job_id } => {
