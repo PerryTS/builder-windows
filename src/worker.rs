@@ -224,7 +224,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
     // Send worker_hello
     let perry_version = get_perry_version(&config.perry_binary);
     let hello = WorkerMessage::WorkerHello {
-        capabilities: vec!["windows".into(), "windows-sign".into()],
+        capabilities: vec!["windows-sign".into()],
         name: config.worker_name.clone().unwrap_or_else(|| {
             hostname::get()
                 .map(|h| h.to_string_lossy().to_string())
