@@ -274,6 +274,11 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                             idle_mins = idle_timeout.as_secs() / 60,
                             "Idle timeout reached, deallocating Azure VM..."
                         );
+                        // Close WebSocket cleanly so the hub removes this worker immediately
+                        let _ = write.send(Message::Close(None)).await;
+                        let _ = write.close().await;
+                        // Small delay so the close frame is sent before we kill the process
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         match crate::azure::deallocate_self(az_config).await {
                             Ok(()) => {
                                 tracing::info!("Deallocate request sent, shutting down");
