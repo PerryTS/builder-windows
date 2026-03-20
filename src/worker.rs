@@ -256,6 +256,9 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
     // Track current cancellation flag
     let cancelled = Arc::new(AtomicBool::new(false));
 
+    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    ping_interval.tick().await; // consume the initial immediate tick
+
     loop {
         let remaining = idle_timeout.saturating_sub(last_activity.elapsed());
 
@@ -265,6 +268,11 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                     Some(msg) => msg,
                     None => break,
                 }
+            }
+            _ = ping_interval.tick() => {
+                // Send WebSocket ping to keep the connection alive through proxies/NAT
+                let _ = write.send(Message::Ping(Vec::new())).await;
+                continue;
             }
             _ = tokio::time::sleep(remaining), if azure_config.is_some() && remaining > std::time::Duration::ZERO => {
                 // Timer expired, will check idle timeout below
