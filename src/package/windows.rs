@@ -686,8 +686,17 @@ fn generate_nsi_script(
     let mut install_files = String::new();
     let mut uninstall_files = String::new();
     for name in file_names {
-        install_files.push_str(&format!("  File \"{bundle_dir_str}\\{name}\"\n"));
-        uninstall_files.push_str(&format!("  Delete \"$INSTDIR\\{name}\"\n"));
+        let src_path = std::path::Path::new(bundle_dir_str).join(name);
+        if src_path.is_dir() {
+            // Use /r for directories, SetOutPath to create subdir
+            install_files.push_str(&format!("  SetOutPath \"$INSTDIR\\{name}\"\n"));
+            install_files.push_str(&format!("  File /r \"{bundle_dir_str}\\{name}\\*.*\"\n"));
+            install_files.push_str("  SetOutPath \"$INSTDIR\"\n");
+            uninstall_files.push_str(&format!("  RMDir /r \"$INSTDIR\\{name}\"\n"));
+        } else {
+            install_files.push_str(&format!("  File \"{bundle_dir_str}\\{name}\"\n"));
+            uninstall_files.push_str(&format!("  Delete \"$INSTDIR\\{name}\"\n"));
+        }
     }
 
     format!(
