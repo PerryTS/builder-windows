@@ -8,10 +8,25 @@ use crate::queue::job::{BuildCredentials, BuildManifest};
 use crate::signing::windows as win_signing;
 use crate::ws::messages::{ServerMessage, StageName};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("readdir {}: {e}", src.display()))? {
+        let entry = entry.map_err(|e| format!("entry: {e}"))?;
+        let dest_path = dst.join(entry.file_name());
+        if entry.file_type().map_or(false, |t| t.is_dir()) {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dest_path)
+                .map_err(|e| format!("copy {}: {e}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
 
 /// Simplified build request for the worker (no queue/broadcast internals)
 pub struct BuildRequest {
@@ -327,6 +342,18 @@ async fn run_sign_only_pipeline(
                     std::fs::copy(&path, &dest)
                         .map_err(|e| format!("Failed to copy DLL: {e}"))?;
                 }
+            }
+        }
+    }
+
+    // Copy asset directories from precompiled bundle (assets/, logo/, etc.)
+    let precompiled_dir = project_dir.join("perry-precompiled");
+    for dir_name in &["assets", "logo", "resources", "images"] {
+        let src = precompiled_dir.join(dir_name);
+        if src.is_dir() {
+            let dest = bundle_dir.join(dir_name);
+            if let Err(e) = copy_dir_recursive(&src, &dest) {
+                tracing::warn!("Failed to copy {dir_name}: {e}");
             }
         }
     }
