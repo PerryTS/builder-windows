@@ -4,11 +4,17 @@ use std::path::Path;
 use zeroize::Zeroize;
 
 /// Determine the signing method and sign the file.
+///
+/// Returns `Ok(true)` when the file was signed, `Ok(false)` when NO signing
+/// credentials were configured (an intentional unsigned dev build — the caller
+/// may warn but should not fail), and `Err` when credentials WERE provided but
+/// signing failed (a real error the caller must surface, not silently ship an
+/// unsigned release binary).
 pub async fn sign_executable(
     file_path: &Path,
     credentials: &BuildCredentials,
     tmpdir: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if credentials.has_pfx() {
         sign_with_signtool(
             file_path,
@@ -18,12 +24,15 @@ pub async fn sign_executable(
             tmpdir,
         )
         .await
+        .map(|_| true)
     } else if credentials.has_azure() {
-        sign_with_azure(file_path, credentials).await
+        sign_with_azure(file_path, credentials).await.map(|_| true)
     } else if credentials.has_gcloud_kms() {
-        sign_with_gcloud_kms(file_path, credentials, tmpdir).await
+        sign_with_gcloud_kms(file_path, credentials, tmpdir)
+            .await
+            .map(|_| true)
     } else {
-        Err("No signing credentials provided (need PFX, Azure Trusted Signing, or Google Cloud KMS)".into())
+        Ok(false)
     }
 }
 
@@ -35,8 +44,7 @@ async fn sign_with_signtool(
     timestamp_url: &str,
     tmpdir: &Path,
 ) -> Result<(), String> {
-    let signtool = config::find_signtool()
-        .ok_or("signtool.exe not found. Install Windows SDK.")?;
+    let signtool = config::find_signtool().ok_or("signtool.exe not found. Install Windows SDK.")?;
 
     // Decode PFX and write to temp file
     use base64::Engine;
@@ -45,8 +53,7 @@ async fn sign_with_signtool(
         .map_err(|e| format!("Invalid PFX base64: {e}"))?;
 
     let pfx_path = tmpdir.join("signing.pfx");
-    std::fs::write(&pfx_path, &pfx_bytes)
-        .map_err(|e| format!("Failed to write temp PFX: {e}"))?;
+    std::fs::write(&pfx_path, &pfx_bytes).map_err(|e| format!("Failed to write temp PFX: {e}"))?;
 
     // Sign
     let output = tokio::process::Command::new(&signtool)
@@ -107,12 +114,14 @@ async fn sign_with_gcloud_kms(
     credentials: &BuildCredentials,
     tmpdir: &Path,
 ) -> Result<(), String> {
-    let signtool = config::find_signtool()
-        .ok_or("signtool.exe not found. Install Windows SDK.")?;
+    let signtool = config::find_signtool().ok_or("signtool.exe not found. Install Windows SDK.")?;
 
     let kms_key = credentials.gcloud_kms_key.as_deref().unwrap();
     let cert_b64 = credentials.gcloud_kms_cert_base64.as_deref().unwrap();
-    let sa_b64 = credentials.gcloud_service_account_base64.as_deref().unwrap();
+    let sa_b64 = credentials
+        .gcloud_service_account_base64
+        .as_deref()
+        .unwrap();
 
     // Ensure CNG provider is installed
     ensure_cng_provider_installed().await?;
@@ -247,7 +256,9 @@ async fn ensure_cng_provider_installed() -> Result<(), String> {
     .map_err(|e| format!("Extract task failed: {e}"))??;
 
     // Find and run the MSI
-    let msi_path = extract_dir.join("kmscng-1.3-windows-amd64").join("kmscng.msi");
+    let msi_path = extract_dir
+        .join("kmscng-1.3-windows-amd64")
+        .join("kmscng.msi");
     if !msi_path.exists() {
         return Err(format!("MSI not found at: {}", msi_path.display()));
     }
@@ -274,10 +285,7 @@ async fn ensure_cng_provider_installed() -> Result<(), String> {
 }
 
 /// Sign a file using Azure Trusted Signing (AzureSignTool).
-async fn sign_with_azure(
-    file_path: &Path,
-    credentials: &BuildCredentials,
-) -> Result<(), String> {
+async fn sign_with_azure(file_path: &Path, credentials: &BuildCredentials) -> Result<(), String> {
     let azure_sign_tool = which_azure_sign_tool()
         .ok_or("AzureSignTool.exe not found. Install via: dotnet tool install -g AzureSignTool")?;
 
