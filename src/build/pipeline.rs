@@ -13,6 +13,32 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
+/// Sign `path`, FAILING the build when signing credentials were provided but
+/// signing errored — so a broken signing setup (e.g. KMS billing disabled,
+/// expired cert) surfaces to the CLI/CI instead of silently shipping an
+/// unsigned release binary. A missing-credentials case (intentional dev build)
+/// only warns.
+async fn sign_or_fail(
+    path: &Path,
+    credentials: &BuildCredentials,
+    tmpdir: &Path,
+    label: &str,
+) -> Result<(), String> {
+    match win_signing::sign_executable(path, credentials, tmpdir).await {
+        Ok(true) => {
+            tracing::info!("Signed {label}");
+            Ok(())
+        }
+        Ok(false) => {
+            tracing::warn!("No Windows signing credentials configured — {label} will be UNSIGNED");
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "Windows signing failed for {label} (credentials were provided): {e}"
+        )),
+    }
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
     for entry in std::fs::read_dir(src).map_err(|e| format!("readdir {}: {e}", src.display()))? {
@@ -79,10 +105,18 @@ fn unpack_precompiled_bundle(
     }
 
     let ico_path = bundle_dir.join("app.ico");
-    let ico_opt = if ico_path.exists() { Some(ico_path) } else { None };
+    let ico_opt = if ico_path.exists() {
+        Some(ico_path)
+    } else {
+        None
+    };
 
     let dll_dir = bundle_dir.join("dlls");
-    let dll_opt = if dll_dir.exists() && dll_dir.is_dir() { Some(dll_dir) } else { None };
+    let dll_opt = if dll_dir.exists() && dll_dir.is_dir() {
+        Some(dll_dir)
+    } else {
+        None
+    };
 
     Ok(PrecompiledBundle {
         exe_path,
@@ -113,11 +147,25 @@ pub async fn execute_build(
             metadata.compiled_by,
             metadata.perry_version
         );
-        run_sign_only_pipeline(request, config, &cancelled, &progress, &tmpdir, &project_dir)
-            .await
+        run_sign_only_pipeline(
+            request,
+            config,
+            &cancelled,
+            &progress,
+            &tmpdir,
+            &project_dir,
+        )
+        .await
     } else {
-        run_windows_pipeline(request, config, &cancelled, &progress, &tmpdir, Some(&project_dir))
-            .await
+        run_windows_pipeline(
+            request,
+            config,
+            &cancelled,
+            &progress,
+            &tmpdir,
+            Some(&project_dir),
+        )
+        .await
     };
 
     // Always clean up build tmpdir
@@ -147,18 +195,25 @@ async fn run_windows_pipeline(
         dir.to_path_buf()
     } else {
         // Stage 1: Extract tarball
-        send_stage(progress, StageName::Extracting, "Extracting project archive");
+        send_stage(
+            progress,
+            StageName::Extracting,
+            "Extracting project archive",
+        );
         check_cancelled(cancelled)?;
         let dir = tmpdir.join("project");
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("Failed to create project dir: {e}"))?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create project dir: {e}"))?;
         extract_tarball(&request.tarball_path, &dir)?;
         send_progress(progress, StageName::Extracting, 100, None);
         dir
     };
 
     // Stage 2: Compile
-    send_stage(progress, StageName::Compiling, "Compiling TypeScript to native");
+    send_stage(
+        progress,
+        StageName::Compiling,
+        "Compiling TypeScript to native",
+    );
     check_cancelled(cancelled)?;
     let binary_name = format!("{}.exe", request.manifest.app_name);
     let binary_path = tmpdir.join("output").join(&binary_name);
@@ -217,10 +272,7 @@ async fn run_windows_pipeline(
     send_stage(progress, StageName::Signing, "Signing executable");
     check_cancelled(cancelled)?;
     let bundled_exe = bundle_dir.join(&binary_name);
-    let signed = win_signing::sign_executable(&bundled_exe, &request.credentials, tmpdir).await;
-    if let Err(ref e) = signed {
-        tracing::warn!("Signing skipped or failed: {e}");
-    }
+    sign_or_fail(&bundled_exe, &request.credentials, tmpdir, "executable").await?;
     send_progress(progress, StageName::Signing, 100, None);
 
     // Stage 6: Package based on distribution mode
@@ -234,10 +286,9 @@ async fn run_windows_pipeline(
     let artifact_path = match distribute {
         "msix" => {
             let msix_path = tmpdir.join(format!("{}.msix", request.manifest.app_name));
-            win_package::create_msix_package(&request.manifest, &bundle_dir, &msix_path, config).await?;
-            // Sign the MSIX too
-            let _ =
-                win_signing::sign_executable(&msix_path, &request.credentials, tmpdir).await;
+            win_package::create_msix_package(&request.manifest, &bundle_dir, &msix_path, config)
+                .await?;
+            sign_or_fail(&msix_path, &request.credentials, tmpdir, "MSIX package").await?;
             msix_path
         }
         "portable" => {
@@ -247,8 +298,7 @@ async fn run_windows_pipeline(
         }
         _ => {
             // Default: NSIS installer
-            let installer_path =
-                tmpdir.join(format!("{}-Setup.exe", request.manifest.app_name));
+            let installer_path = tmpdir.join(format!("{}-Setup.exe", request.manifest.app_name));
             win_package::create_nsis_installer(
                 &request.manifest,
                 &bundle_dir,
@@ -256,13 +306,7 @@ async fn run_windows_pipeline(
                 config,
             )
             .await?;
-            // Sign the installer too
-            let _ = win_signing::sign_executable(
-                &installer_path,
-                &request.credentials,
-                tmpdir,
-            )
-            .await;
+            sign_or_fail(&installer_path, &request.credentials, tmpdir, "installer").await?;
             installer_path
         }
     };
@@ -305,22 +349,38 @@ async fn run_sign_only_pipeline(
         .unwrap_or("installer");
 
     // Stage 1: Already extracted
-    send_stage(progress, StageName::Extracting, "Precompiled bundle extracted");
+    send_stage(
+        progress,
+        StageName::Extracting,
+        "Precompiled bundle extracted",
+    );
     send_progress(progress, StageName::Extracting, 100, None);
 
     // Stage 2: Skip compilation (already done by Linux worker)
-    send_stage(progress, StageName::Compiling, "Skipping compilation (precompiled by Linux worker)");
+    send_stage(
+        progress,
+        StageName::Compiling,
+        "Skipping compilation (precompiled by Linux worker)",
+    );
     send_progress(progress, StageName::Compiling, 100, None);
 
     // Stage 3: Skip asset generation (ICO already in bundle)
-    send_stage(progress, StageName::GeneratingAssets, "Using precompiled assets");
+    send_stage(
+        progress,
+        StageName::GeneratingAssets,
+        "Using precompiled assets",
+    );
     send_progress(progress, StageName::GeneratingAssets, 100, None);
 
     // Unpack the precompiled bundle
     let bundle = unpack_precompiled_bundle(project_dir, &request.manifest.app_name)?;
 
     // Stage 4: Bundle — copy exe + DLLs and embed PE resources
-    send_stage(progress, StageName::Bundling, "Embedding resources into executable");
+    send_stage(
+        progress,
+        StageName::Bundling,
+        "Embedding resources into executable",
+    );
     check_cancelled(cancelled)?;
     let bundle_dir = tmpdir.join("bundle");
     std::fs::create_dir_all(&bundle_dir)
@@ -339,8 +399,7 @@ async fn run_sign_only_pipeline(
                 let path = entry.path();
                 if path.is_file() {
                     let dest = bundle_dir.join(entry.file_name());
-                    std::fs::copy(&path, &dest)
-                        .map_err(|e| format!("Failed to copy DLL: {e}"))?;
+                    std::fs::copy(&path, &dest).map_err(|e| format!("Failed to copy DLL: {e}"))?;
                 }
             }
         }
@@ -367,10 +426,7 @@ async fn run_sign_only_pipeline(
     send_stage(progress, StageName::Signing, "Signing executable");
     check_cancelled(cancelled)?;
     let bundled_exe = bundle_dir.join(&binary_name);
-    let signed = win_signing::sign_executable(&bundled_exe, &request.credentials, tmpdir).await;
-    if let Err(ref e) = signed {
-        tracing::warn!("Signing skipped or failed: {e}");
-    }
+    sign_or_fail(&bundled_exe, &request.credentials, tmpdir, "executable").await?;
     send_progress(progress, StageName::Signing, 100, None);
 
     // Stage 6: Package based on distribution mode
@@ -384,8 +440,9 @@ async fn run_sign_only_pipeline(
     let artifact_path = match distribute {
         "msix" => {
             let msix_path = tmpdir.join(format!("{}.msix", request.manifest.app_name));
-            win_package::create_msix_package(&request.manifest, &bundle_dir, &msix_path, config).await?;
-            let _ = win_signing::sign_executable(&msix_path, &request.credentials, tmpdir).await;
+            win_package::create_msix_package(&request.manifest, &bundle_dir, &msix_path, config)
+                .await?;
+            sign_or_fail(&msix_path, &request.credentials, tmpdir, "MSIX package").await?;
             msix_path
         }
         "portable" => {
@@ -402,21 +459,28 @@ async fn run_sign_only_pipeline(
                 config,
             )
             .await?;
-            let _ = win_signing::sign_executable(&installer_path, &request.credentials, tmpdir).await;
+            sign_or_fail(&installer_path, &request.credentials, tmpdir, "installer").await?;
             installer_path
         }
     };
     send_progress(progress, StageName::Packaging, 100, None);
 
     // Stage 7: Publishing (deferred)
-    send_stage(progress, StageName::Publishing, "Skipping store upload (not configured)");
+    send_stage(
+        progress,
+        StageName::Publishing,
+        "Skipping store upload (not configured)",
+    );
     send_progress(progress, StageName::Publishing, 100, None);
 
     let final_path = copy_artifact(
         &artifact_path,
         &request.manifest.app_name,
         &request.job_id,
-        artifact_path.extension().and_then(|e| e.to_str()).unwrap_or("exe"),
+        artifact_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("exe"),
     )?;
     Ok(final_path)
 }
